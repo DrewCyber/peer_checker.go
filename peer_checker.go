@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net"
@@ -25,14 +27,21 @@ var (
 const connTimeout = 5 * time.Second
 
 type Peer struct {
-	URI      string
-	protocol string
-	host     string
-	port     int
-	Region   string
-	Country  string
-	Up       bool
-	Latency  time.Duration
+	URI       string        `json:"uri"`
+	protocol  string        // unexported, ignored by json
+	host      string        // unexported, ignored by json
+	port      int           // unexported, ignored by json
+	Region    string        `json:"region"`
+	Country   string        `json:"country"`
+	Up        bool          `json:"up"`
+	Latency   time.Duration `json:"-"`       // Internal use, hidden from JSON
+	LatencyMs float64       `json:"latency"` // Exported for JSON in milliseconds
+}
+
+// JSONResult defines the structure for json output
+type JSONResult struct {
+	Alive  []Peer `json:"alive"`
+	Source []Peer `json:"source"`
 }
 
 func getPeers(dataDir string, regions []string, countries []string) ([]Peer, error) {
@@ -77,7 +86,6 @@ func getPeers(dataDir string, regions []string, countries []string) ([]Peer, err
 				}
 				matches := PEER_REGEX.FindAllStringSubmatch(string(content), -1)
 				for _, match := range matches {
-					// fmt.Println("Match:", match)
 					uri := match[0]
 					protocol := match[1]
 					host := match[2]
@@ -117,6 +125,8 @@ func isUp(peer *Peer) {
 		return
 	}
 
+	var duration time.Duration
+
 	switch peer.protocol {
 	case "tcp", "tls":
 		startTime := time.Now()
@@ -127,7 +137,7 @@ func isUp(peer *Peer) {
 			return
 		}
 		defer conn.Close()
-		peer.Latency = time.Since(startTime)
+		duration = time.Since(startTime)
 		peer.Up = true
 	case "quic":
 		// Create a context
@@ -141,12 +151,20 @@ func isUp(peer *Peer) {
 			return
 		}
 		defer conn.CloseWithError(0, "Closing connection")
-		peer.Latency = time.Since(startTime)
+		duration = time.Since(startTime)
 		peer.Up = true
+	}
+
+	if peer.Up {
+		peer.Latency = duration
+		// Convert duration to milliseconds with floating point precision
+		peer.LatencyMs = float64(duration.Microseconds()) / 1000.0
 	}
 }
 
 func printResults(results []Peer) {
+	fmt.Println("Report date:", time.Now().Format(time.RFC1123))
+
 	fmt.Println("Dead peers:")
 	deadTable := tabwriter.NewWriter(os.Stdout, 1, 1, 1, ' ', 0)
 	fmt.Fprintln(deadTable, "URI\tLocation")
@@ -170,28 +188,56 @@ func printResults(results []Peer) {
 		return alivePeers[i].Latency < alivePeers[j].Latency
 	})
 	for _, p := range alivePeers {
-		latency := p.Latency.Seconds() * 1000
-		fmt.Fprintf(aliveTable, "%s\t%.3f\t%s/%s\n", p.URI, latency, p.Region, p.Country)
+		fmt.Fprintf(aliveTable, "%s\t%.3f\t%s/%s\n", p.URI, p.LatencyMs, p.Region, p.Country)
 	}
 	aliveTable.Flush()
 }
 
+func printJSON(peers []Peer) {
+	alivePeers := []Peer{}
+	for _, p := range peers {
+		if p.Up {
+			alivePeers = append(alivePeers, p)
+		}
+	}
+
+	// Sort alive peers by latency (same logic as text output)
+	sort.Slice(alivePeers, func(i, j int) bool {
+		return alivePeers[i].Latency < alivePeers[j].Latency
+	})
+
+	output := JSONResult{
+		Alive:  alivePeers,
+		Source: peers,
+	}
+
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(output); err != nil {
+		fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
+	}
+}
+
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Printf("Usage: %s [path to public_peers repository on a disk]\n", os.Args[0])
+	// Define flags
+	jsonOutput := flag.Bool("json", false, "Output results in JSON format")
+	flag.Parse()
+
+	// Handle positional arguments (path is expected after flags)
+	args := flag.Args()
+	if len(args) != 1 {
+		fmt.Printf("Usage: %s [-json] [path to public_peers repository on a disk]\n", os.Args[0])
 		fmt.Printf("I.e.:  %s ~/Projects/yggdrasil/public_peers\n", os.Args[0])
 		return
 	}
 
-	dataDir := os.Args[1]
+	dataDir := args[0]
 
 	peers, err := getPeers(dataDir, nil, nil)
 	if err != nil {
 		fmt.Printf("Can't find peers in a directory: %s\n", dataDir)
 		return
 	}
-
-	fmt.Println("Report date:", time.Now().Format(time.RFC1123))
 
 	var wg sync.WaitGroup
 
@@ -204,5 +250,10 @@ func main() {
 	}
 
 	wg.Wait()
-	printResults(peers)
+
+	if *jsonOutput {
+		printJSON(peers)
+	} else {
+		printResults(peers)
+	}
 }
